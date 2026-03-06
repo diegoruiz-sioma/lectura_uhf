@@ -18,6 +18,7 @@ import hxsigma as hs
 import backup
 import datetime
 import x708
+import rfiduhf
 
 
 
@@ -292,123 +293,40 @@ class CheckBat(threading.Thread):
             time.sleep(TIEMPO_CHECK_BATERIA)
 
 
-
 class RFIDRead(threading.Thread):
-
     def __init__(self):
         threading.Thread.__init__(self)
 
         try:
-            self.ser = serial.Serial(
-                "/dev/ttyUSB0",
-                baudrate=115200,
-                timeout=0.1
-            )
+            self.ser = serial.Serial("/dev/ttyS0",
+                                     baudrate = 9600,
+                                     parity=serial.PARITY_NONE,
+                                     stopbits=serial.STOPBITS_ONE,
+                                     bytesize=serial.EIGHTBITS,
+                                     timeout=1)
         except Exception as e:
-            print("ERROR SERIAL RFID:", e)
+            pass
+            #print("ERROR EN PUERTO SERIAL RFID: ", repr(e))
 
-        # comandos lector
-        self.CMD_POTENCIA = bytes.fromhex("BB 00 B6 00 02 0A 28 EA 7E")
-        self.CMD_REGION   = bytes.fromhex("BB 00 07 00 01 02 0A 7E")
-        self.CMD_FREQ     = bytes.fromhex("BB 00 AB 00 01 1A C6 7E")
-        self.CMD_LEER     = bytes.fromhex("BB 00 27 00 03 22 FF FF 4A 7E")
-
-        self.ventana = {}
-        self.tags_vistos = set()
-        self.cola_tags = []
-
-        self.ventana_inicio = None
-        self.VENTANA_TIEMPO = 2
-        self.MIN_CONFIRMACIONES = 3
-
-    def iniciar_lector(self):
-        try:
-            self.ser.write(self.CMD_POTENCIA)
-            time.sleep(0.2)
-            self.ser.write(self.CMD_REGION)
-            time.sleep(0.2)
-            self.ser.write(self.CMD_FREQ)
-            time.sleep(0.2)
-            self.ser.write(self.CMD_LEER)
-            print("RFID iniciado")
-        except Exception as e:
-            print("ERROR configurando lector:", e)
-
-    def leer_epc(self):
-        data = self.ser.read(1024)
-        if not data:
-            return None
-        try:
-            hexdata = data.hex()
-            epc = hexdata[16:40]
-            if len(epc) < 8:
-                return None
-            return epc
-        except:
-            return None
-
-    def procesar_ventana(self, epc):
-        ahora = time.time()
-
-        if self.ventana_inicio is None:
-            self.ventana_inicio = ahora
-
-        if epc not in self.ventana:
-            self.ventana[epc] = 0
-
-        self.ventana[epc] += 1
-
-        if ahora - self.ventana_inicio >= self.VENTANA_TIEMPO:
-
-            for tag, count in self.ventana.items():
-
-                if count >= self.MIN_CONFIRMACIONES:
-
-                    if tag not in self.tags_vistos:
-                        self.tags_vistos.add(tag)
-                        self.cola_tags.append(tag)
-                        print("TAG agregado a cola:", tag)
-
-            self.ventana = {}
-            self.ventana_inicio = None
-
-    def entregar_tag(self):
-
-        if len(self.cola_tags) > 0:
-
-            tag = self.cola_tags.pop(0)
-
-            funciones.Set_parametro('RFID_SERIAL', tag)
-            funciones.Set_parametro('RFID_ON', 1)
-
-            print("TAG entregado a Sigma:", tag)
+        self.RFIDdata = ''
+        self.RFIDflag = 0
 
     def run(self):
-
-        self.iniciar_lector()
-
         while True:
-
             try:
+                self.RFIDdata = self.ser.readline().strip().decode("utf-8").strip()
+                if len(self.RFIDdata) > 10:
+                    self.RFIDflag = 1
+                    self.RFIDdata = self.RFIDdata[len(self.RFIDdata)-8:]
+                    self.RFIDdata = str(int(self.RFIDdata, base=16))
+                    funciones.Set_parametro('RFID_ON', self.RFIDflag)
+                    funciones.Set_parametro('RFID_SERIAL',self.RFIDdata)
+                    #print("RFID Tag detected:", self.RFIDdata)
 
-                epc = self.leer_epc()
-
-                if epc:
-                    self.procesar_ventana(epc)
-
-                RFID_ON = int(funciones.Get_parametro("RFID_ON"))
-
-                if RFID_ON == 0 and len(self.cola_tags) > 0:
-                    self.entregar_tag()
-
-            except Exception:
+            except Exception as e:
+                #print("ERROR EN LECTURA RFID: " + repr(e))
                 pass
-
-            time.sleep(0.05)
-
 #####################################################################
-######               Metodos de inicializacion                #######
-
 ######               Metodos de inicializacion                #######
 
 
@@ -525,12 +443,15 @@ print("INICIANDO")
 lecturaPeso = GetPeso()
 sincronizacion = UpLoad()
 bateria = CheckBat()
-RFID = RFIDRead()
+# RFID = RFIDRead()  # replaced by RFIDUHF
 
 lecturaPeso.start()
 sincronizacion.start()
 bateria.start()
-RFID.start()
+# RFID.start()  # replaced
+rfid = rfiduhf.RFIDUHF()
+thread_rfid = threading.Thread(target=rfid.run)
+thread_rfid.start()
 
 
 funciones.Set_parametro('estado_hx', -666)
