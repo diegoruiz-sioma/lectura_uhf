@@ -18,24 +18,6 @@ import hxsigma as hs
 import backup
 import datetime
 import x708
-from collections import deque
-import queue as pyqueue
-
-# --- SIGMA UHF FIFO MATCHING (RFID <-> PESO) ---
-# Colas inter-proceso. RFID (thread) -> tag_queue; Peso (process) -> peso_queue
-tag_queue = mp.Queue()  # (ts, epc_hex)
-peso_queue = mp.Queue() # (ts, peso, estado, fecha, viaje_id, cantidad, pesovastago)
-
-#####################################################################
-######               COMANDOS RFID                            #######
-#####################################################################
-
-CMD_POTENCIA = bytes.fromhex("BB 00 B6 00 02 0A 28 EA 7E") # 26dBm
-CMD_REGION   = bytes.fromhex("BB 00 07 00 01 02 0A 7E")    # US Region
-CMD_FREQ     = bytes.fromhex("BB 00 AB 00 01 1A C6 7E")    # Canal RF
-CMD_LEER     = bytes.fromhex("BB 00 27 00 03 22 FF FF 4A 7E") # Lectura Continua
-CMD_STOP     = bytes.fromhex("BB 00 28 00 00 28 7E")
-
 
 
 
@@ -66,9 +48,7 @@ SCK = 9
 ######               Hilos de ejecucion                       #######
 #### Hilo encargado de leer los valores de peso
 class GetPeso(mp.Process):
-    def __init__(self, peso_queue):
-        self.peso_queue = peso_queue
-
+    def __init__(self):
         mp.Process.__init__(self)
         # Inicializacion de las variables para lectura de pesos
         self.lectura = 0
@@ -127,7 +107,8 @@ class GetPeso(mp.Process):
             self.estadoActual = True
             RFID_ON = int(funciones.Get_parametro("RFID_ON"))
             if RFID_ON == 1:
-                                self.RFIDserial = funciones.Get_parametro("RFID_SERIAL")
+                funciones.Set_parametro("RFID_ON", 0)
+                self.RFIDserial = funciones.Get_parametro("RFID_SERIAL")
         # Se valida si el peso pasa por el limite de bajada o si en las ultimas 4 lecturas hubo un cambio menor al delta peso
         elif self.lectura < self.DOWN_RANGE or (self.vectorFiltro[0]-self.vectorFiltro[3]) < (-1*self.DELTA_PESO):
             self.estadoActual = False
@@ -182,7 +163,7 @@ class GetPeso(mp.Process):
             self.viaje_id = funciones.Get_last_viaje()
             if self.estado == 0:
                 self.pesovastago = round((float(peso) * float(self.vastago)), 2)
-                self.peso_queue.put((time.time(), peso, self.estado, fecha, self.viaje_id, self.cantidad, self.pesovastago))
+                funciones.Update_db(peso, self.estado, fecha, self.viaje_id, self.cantidad, self.RFIDserial,self.pesovastago)
 
         else:
             print("Cantidad de datos insuficientes para obtener un peso valido")
@@ -311,229 +292,246 @@ class CheckBat(threading.Thread):
             time.sleep(TIEMPO_CHECK_BATERIA)
 
 
+
 class RFIDRead(threading.Thread):
-    """Lee tags UHF en continuo y los pone en tag_queue (FIFO).
 
-    Qué hace:
-    - Configura el/los lectores (REGION, FREQ, POTENCIA, LEER).
-    - Lee tramas en modo inventario continuo.
-    - Extrae EPC en HEX.
-    - Aplica anti-duplicado por EPC (tiempo_relectura segundos).
-    - Encola (timestamp, EPC) en tag_queue.
-    """
+    def __init__(self):
+        threading.Thread.__init__(self)
 
-    def __init__(self, tag_queue):
-        super().__init__()
-        self.daemon = True
-        self.tag_queue = tag_queue
-
-        self.ultimas_vistas = {}   # epc -> ts
-        self.tiempo_relectura = 3.0
-
-        self.lectores = []
-
-    def _puertos_candidatos(self):
-        puertos = []
-        for p in serial.tools.list_ports.comports():
-            dev = getattr(p, "device", "")
-            if dev and (("ttyUSB" in dev) or ("ttyACM" in dev)):
-                puertos.append(dev)
-        return puertos
-
-    def _configurar_lector(self, ser):
-        ser.write(CMD_REGION);   time.sleep(0.08)
-        ser.write(CMD_FREQ);     time.sleep(0.08)
-        ser.write(CMD_POTENCIA); time.sleep(0.08)
-        ser.write(CMD_LEER);     time.sleep(0.05)
-
-    def _detectar_lectores(self):
-        self.lectores.clear()
-        puertos = self._puertos_candidatos()
-        if not puertos:
-            print("RFID: no se detectaron lectores (ttyUSB/ttyACM).")
-            return False
-
-        for puerto in puertos:
-            try:
-                ser = serial.Serial(puerto, 115200, timeout=0.05)
-                self._configurar_lector(ser)
-                self.lectores.append(ser)
-                print("RFID conectado en", puerto)
-            except Exception as e:
-                print("RFID: error conectando", puerto, repr(e))
-
-        return len(self.lectores) > 0
-
-    def _publicar_tag(self, epc_hex):
         try:
-            self.tag_queue.put((time.time(), epc_hex))
-            print("RFID TAG:", epc_hex)
+            self.ser = serial.Serial(
+                "/dev/ttyUSB0",
+                baudrate=115200,
+                timeout=0.1
+            )
         except Exception as e:
-            print("RFID: no se pudo encolar TAG", repr(e))
+            print("ERROR SERIAL RFID:", e)
 
-    def _procesar_trama(self, trama):
-        # Frame inicia en 0xBB y el payload length va en [3:5]
-        if len(trama) < 8 or trama[0] != 0xBB:
-            return
+        # comandos lector
+        self.CMD_POTENCIA = bytes.fromhex("BB 00 B6 00 02 0A 28 EA 7E")
+        self.CMD_REGION   = bytes.fromhex("BB 00 07 00 01 02 0A 7E")
+        self.CMD_FREQ     = bytes.fromhex("BB 00 AB 00 01 1A C6 7E")
+        self.CMD_LEER     = bytes.fromhex("BB 00 27 00 03 22 FF FF 4A 7E")
 
-        pl = (trama[3] << 8) | trama[4]
-        params = trama[5:5+pl]
-        if len(params) < 4:
-            return
+        self.ventana = {}
+        self.tags_vistos = set()
+        self.cola_tags = []
 
-        # EPC variable (HEX)
-        epc_hex = params[3:].hex().upper()
-        if not epc_hex:
-            return
+        self.ventana_inicio = None
+        self.VENTANA_TIEMPO = 2
+        self.MIN_CONFIRMACIONES = 3
 
+    def iniciar_lector(self):
+        try:
+            self.ser.write(self.CMD_POTENCIA)
+            time.sleep(0.2)
+            self.ser.write(self.CMD_REGION)
+            time.sleep(0.2)
+            self.ser.write(self.CMD_FREQ)
+            time.sleep(0.2)
+            self.ser.write(self.CMD_LEER)
+            print("RFID iniciado")
+        except Exception as e:
+            print("ERROR configurando lector:", e)
+
+    def leer_epc(self):
+        data = self.ser.read(1024)
+        if not data:
+            return None
+        try:
+            hexdata = data.hex()
+            epc = hexdata[16:40]
+            if len(epc) < 8:
+                return None
+            return epc
+        except:
+            return None
+
+    def procesar_ventana(self, epc):
         ahora = time.time()
-        last = self.ultimas_vistas.get(epc_hex)
 
-        # Anti duplicado (equivalente a ordenar.py en vivo)
-        if (last is None) or ((ahora - last) > self.tiempo_relectura):
-            self.ultimas_vistas[epc_hex] = ahora
-            self._publicar_tag(epc_hex)
+        if self.ventana_inicio is None:
+            self.ventana_inicio = ahora
 
-    def run(self):
-        # Detectar lectores y reintentar si no hay
-        if not self._detectar_lectores():
-            while True:
-                time.sleep(2.0)
-                if self._detectar_lectores():
-                    break
+        if epc not in self.ventana:
+            self.ventana[epc] = 0
 
-        buffers = {id(ser): bytearray() for ser in self.lectores}
+        self.ventana[epc] += 1
 
-        while True:
-            # Si se quedaron sin lectores, re-detectar
-            if not self.lectores:
-                time.sleep(2.0)
-                self._detectar_lectores()
-                buffers = {id(ser): bytearray() for ser in self.lectores}
-                continue
+        if ahora - self.ventana_inicio >= self.VENTANA_TIEMPO:
 
-            for ser in list(self.lectores):
-                try:
-                    buf = buffers.setdefault(id(ser), bytearray())
-                    chunk = ser.read(ser.in_waiting or 1)
-                    if chunk:
-                        buf.extend(chunk)
+            for tag, count in self.ventana.items():
 
-                    # Parseo: BB .... PL .... 7E  (longitud total = 7 + PL)
-                    while True:
-                        ini = buf.find(b'\xBB')
-                        if ini < 0:
-                            buf.clear()
-                            break
-                        if ini > 0:
-                            del buf[:ini]
-                        if len(buf) < 5:
-                            break
+                if count >= self.MIN_CONFIRMACIONES:
 
-                        pl = (buf[3] << 8) | buf[4]
-                        frame_len = 7 + pl
-                        if len(buf) < frame_len:
-                            break
+                    if tag not in self.tags_vistos:
+                        self.tags_vistos.add(tag)
+                        self.cola_tags.append(tag)
+                        print("TAG agregado a cola:", tag)
 
-                        trama = bytes(buf[:frame_len])
-                        del buf[:frame_len]
+            self.ventana = {}
+            self.ventana_inicio = None
 
-                        # Respuesta inventario
-                        if len(trama) >= 3 and trama[1] == 0x02 and trama[2] == 0x22:
-                            self._procesar_trama(trama)
+    def entregar_tag(self):
 
-                except Exception as e:
-                    print("RFID: lector desconectado/error:", repr(e))
-                    try:
-                        self.lectores.remove(ser)
-                    except Exception:
-                        pass
-                    try:
-                        ser.close()
-                    except Exception:
-                        pass
+        if len(self.cola_tags) > 0:
 
-            time.sleep(0.01)
+            tag = self.cola_tags.pop(0)
 
+            funciones.Set_parametro('RFID_SERIAL', tag)
+            funciones.Set_parametro('RFID_ON', 1)
 
-class Matcher(threading.Thread):
-    """Empareja FIFO tags y pesos sin bloquear el pesaje.
-
-    Regla:
-    - Si hay PESO y TAG disponibles: PESO1->TAG1, PESO2->TAG2...
-    - Si llega un peso y no hay tag por 'ventana' segundos: se guarda con 'NO_TAG' para NO frenar la operación.
-    - Si SIGMA abre un viaje nuevo, se limpian colas para evitar mezcla entre viajes.
-    """
-
-    def __init__(self, tag_queue, peso_queue, ventana_seg=2.0):
-        super().__init__()
-        self.daemon = True
-        self.tag_queue = tag_queue
-        self.peso_queue = peso_queue
-        self.ventana = float(ventana_seg)
-
-        self.tags = deque()   # (ts, epc)
-        self.pesos = deque()  # (ts, peso, estado, fecha, viaje_id, cantidad, pesovastago)
-        self.viaje_actual = None
-
-    def _drain(self):
-        # Pasar lo que haya en las mp.Queue a deques locales (más rápido)
-        while True:
-            try:
-                self.tags.append(self.tag_queue.get_nowait())
-            except pyqueue.Empty:
-                break
-            except Exception:
-                break
-
-        while True:
-            try:
-                self.pesos.append(self.peso_queue.get_nowait())
-            except pyqueue.Empty:
-                break
-            except Exception:
-                break
+            print("TAG entregado a Sigma:", tag)
 
     def run(self):
+
+        self.iniciar_lector()
+
         while True:
+
             try:
-                viaje = funciones.Get_last_viaje()
-                if self.viaje_actual is None:
-                    self.viaje_actual = viaje
 
-                # Detectar cambio de viaje para limpiar colas
-                if viaje != self.viaje_actual:
-                    self.tags.clear()
-                    self.pesos.clear()
-                    self._drain()  # drenar colas de mp.Queue también
-                    self.tags.clear()
-                    self.pesos.clear()
-                    self.viaje_actual = viaje
-                    print("MATCHER: CAMBIO DE VIAJE -> COLAS LIMPIAS")
+                epc = self.leer_epc()
 
-                self._drain()
+                if epc:
+                    self.procesar_ventana(epc)
 
-                # Emparejar FIFO mientras haya de ambos
-                while self.pesos and self.tags:
-                    ts_p, peso, estado, fecha, viaje_id, cantidad, pesovastago = self.pesos.popleft()
-                    ts_t, epc = self.tags.popleft()
+                RFID_ON = int(funciones.Get_parametro("RFID_ON"))
 
-                    funciones.Update_db(peso, estado, fecha, viaje_id, cantidad, epc, pesovastago)
-                    print("MATCHER: EMPAREJADO", peso, epc)
+                if RFID_ON == 0 and len(self.cola_tags) > 0:
+                    self.entregar_tag()
 
-                # Si hay pesos sin tag, esperar ventana; luego guardar NO_TAG
-                if self.pesos and (not self.tags):
-                    ts_p, peso, estado, fecha, viaje_id, cantidad, pesovastago = self.pesos[0]
-                    if (time.time() - ts_p) > self.ventana:
-                        self.pesos.popleft()
-                        funciones.Update_db(peso, estado, fecha, viaje_id, cantidad, "NO_TAG", pesovastago)
-                        print("MATCHER: PESO SIN TAG (NO_TAG)", peso)
+            except Exception:
+                pass
 
-            except Exception as e:
-                print("MATCHER: ERROR", repr(e))
+            time.sleep(0.05)
 
-            time.sleep(0.02)
+#####################################################################
+######               Metodos de inicializacion                #######
+
+######               Metodos de inicializacion                #######
 
 
-matcher = Matcher(tag_queue, peso_queue, ventana_seg=2.0)
-matcher.start()
+### Inicializacion de base de datos
+funciones.Conect_db_parametros()
+
+### Inicializacion de parametros
+funciones.Set_parametro("cant_rapido", CANTDATOSRACIMO)
+funciones.Set_parametro("lb", 0)
+funciones.Set_parametro("RFID_ON",0)
+funciones.Set_parametro("nuevo_viaje", 0)
+
+### Validacion de la conexion a internet
+while (online == 0) & (intentosConexion < 5):
+    try:
+        online = funciones.Test_online()
+        if online == 0:
+            intentosConexion += 1
+        print(intentosConexion)
+    except:
+        intentosConexion = intentosConexion + 1
+        print(intentosConexion)
+
+# Guardar el estado del contenido de las tablas
+contentTablas = funciones.Check_contenido_tablas(SYNCTABLAS)
+
+### Actualizacion de tablas
+if online or not contentTablas:
+    ### Aviso de inicio al servidor ##### QUITAR
+    estomaInfo = credentials.Get_Estoma_Info()
+    estomaId = estomaInfo[0]
+    print(funciones.Web_conex("inicio", estomaId, timeout=5))
+    # Vectores para el manejo de los estados de descarga de las tablas
+    estadoTablas = []
+    estados = []
+    # Concatenar el estado cero al vector de tablas
+    for tabla in SYNCTABLAS:
+        estadoTablas.append([tabla, 0])
+    # ejecutar el ciclo mientras alguno de los estados de las tablas siga siendo cero
+    [estados.append(estado[1]) for estado in estadoTablas]
+    while min(estados) < 1:
+        try:
+            for tabla in estadoTablas:
+                nombre = tabla[0]
+                estado = tabla[1]
+                if estado == 0:
+                    funciones.Actualizar_tabla(nombre)
+                if funciones.Check_contenido_tablas([tabla[0]]):
+                    tabla[1] = 1
+
+            print(estadoTablas)
+
+            estados = []
+            [estados.append(estado[1]) for estado in estadoTablas]
+
+        except Exception as e:
+            print("ERROR ACTUALIZANDO TABLAS: ", repr(e))
+
+cod_barcadillero = funciones.Get_barcadillero()
+funciones.Set_parametro("barcadillero_codigo", cod_barcadillero)
+
+vastago = funciones.Get_vastago()
+funciones.Set_parametro("Vastago", vastago)
+
+PESOMINIMO = float(funciones.Get_parametro_estoma("peso_minimo_racimitos"))
+print("Peso minimo: ", PESOMINIMO)
+PESOMAXIMO = float(funciones.Get_parametro_estoma("peso_maximo_racimitos"))
+print("Peso maximo: ", PESOMAXIMO)
+TARA = float(funciones.Get_parametro_estoma("tara_racimitos"))
+print("Tara: ", TARA)
+TARAPRIMERO = float(funciones.Get_parametro_estoma("tara_primer_racimito"))
+print("Tara primer racimo: ", TARAPRIMERO)
+TIEMPOMINIMO = float(funciones.Get_parametro_estoma("tiempo_minimo_racimitos"))
+print("Tiempo minimo entre racimos: ", TIEMPOMINIMO)
+funciones.Save_wifi()
+
+
+### Crear parametro de lote_default
+cursor, conectar = funciones.Create_cursor(json=True)
+conectar.commit()
+cursor.execute("select * from lotes limit 1")
+recs = cursor.fetchall()
+rows = [dict(rec) for rec in recs]
+funciones.Set_parametro("lote_default", rows[0]['lote_id'])
+
+
+#### Validacion de validacion diaria
+lastValidacion = funciones.Get_Last_Validacion()
+fechaHoy = funciones.Actualizar_hora(dia=1)
+print("Ultima Validacion: ", lastValidacion, "Fecha actual: ", fechaHoy)
+if lastValidacion is not None:
+    print("Diferencia: ", (fechaHoy - lastValidacion.date()).days)
+
+
+if lastValidacion is None or (fechaHoy - lastValidacion.date()).days >= PERIODOVALIDACION:
+    calibracion = 2
+    validacion = 0
+else:
+    print("Validacion de equipo se encuntra al dia")
+    validacion = 0
+
+
+#Revision cero
+funciones.Get_info_cero()
+
+### Inicializacion de sensor de peso
+sensor = hs.HxSigma(debug=HXDEBUG)
+funciones.Set_parametro("validacion", validacion)
+
+funciones.Set_parametro('estado_hx', 6)
+print("INICIANDO")
+
+### Inicializacion de hilos
+lecturaPeso = GetPeso()
+sincronizacion = UpLoad()
+bateria = CheckBat()
+RFID = RFIDRead()
+
+lecturaPeso.start()
+sincronizacion.start()
+bateria.start()
+RFID.start()
+
+
+funciones.Set_parametro('estado_hx', -666)
+print("BASCULA LISTA PARA PESAR")
